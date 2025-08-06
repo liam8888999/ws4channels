@@ -16,48 +16,8 @@ let screenshotStream;
 let ffmpegProcess;
 let inactivityTimer;
 let restartingPage = false;
-let fakeSegmentCreated = false;
 
-// ─── Utility: create initial fake black segment ──────────────────────────
-function createFakeSegment() {
-  if (!fs.existsSync(STREAM_DIR)) fs.mkdirSync(STREAM_DIR);
 
-  const fakeSegmentPath = path.join(STREAM_DIR, 'stream0.ts');
-  const fakePlaylistPath = path.join(STREAM_DIR, 'stream.m3u8');
-
-  // Only generate if it doesn't exist
-  if (fs.existsSync(fakeSegmentPath)) return Promise.resolve();
-
-  return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input('color=black:s=640x360:d=2') // 2s black frame
-      .inputFormat('lavfi')
-      .outputOptions([
-        '-c:v libx264',
-        '-t 2',
-        '-pix_fmt yuv420p',
-        '-f hls',
-        '-hls_time 2',
-        '-hls_list_size 1',
-        '-hls_flags append_list+delete_segments',
-        '-hls_allow_cache 0',
-      ])
-      .output(fakePlaylistPath)
-      .on('start', cmd => console.log('Creating fake segment for VLC:', cmd))
-      .on('error', err => reject(err))
-      .on('end', () => {
-        console.log('Fake segment ready');
-        resolve();
-      })
-      .run();
-  });
-}
-
-async function ensureFakeSegment() {
-  if (fakeSegmentCreated) return;
-  await createFakeSegment();
-  fakeSegmentCreated = true;
-}
 
 // ─── Puppeteer setup ────────────────────────────────────────────────
 async function initializeBrowser() {
@@ -107,10 +67,9 @@ async function startStream() {
   if (streamStarted) return;
   streamStarted = true;
 
-  // Clean folder except fake segment
   if (fs.existsSync(STREAM_DIR)) {
     fs.readdirSync(STREAM_DIR).forEach(f => {
-      if (!f.startsWith('stream0')) fs.unlinkSync(path.join(STREAM_DIR, f));
+      fs.unlinkSync(path.join(STREAM_DIR, f));
     });
   }
 
@@ -169,12 +128,6 @@ async function startStream() {
       }
     }
   })();
-
-  // 👇 Add the segment count logger here
-  setInterval(() => {
-    const tsFiles = fs.readdirSync(STREAM_DIR).filter(f => f.endsWith('.ts'));
-    console.log('Segment count:', tsFiles.length);
-  }, 500);
 }
 
 //}
@@ -212,13 +165,11 @@ app.get('/stream.m3u8', async (req, res) => {
   try {
     resetInactivityTimer();
 
-    // Only ensure fake segment once
-    await ensureFakeSegment();
 
     await startStream();
 
     // Wait for at least 3 real segments to exist
-    const maxWait = 5000;
+    const maxWait = 1000;
     const pollInterval = 100;
     const start = Date.now();
     while (Date.now() - start < maxWait) {
@@ -261,8 +212,6 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  // Create the fake segment once at startup
-  await ensureFakeSegment();
   await initializeBrowser();
   console.log(`Browser ready. HTTP server running on http://localhost:${PORT}`);
 });
