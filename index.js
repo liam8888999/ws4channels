@@ -75,7 +75,7 @@ async function startStream() {
 
   screenshotStream = new PassThrough();
 
-  ffmpeg()
+  ffmpegProcess = ffmpeg()
   .input(screenshotStream)
   .inputFormat('image2pipe')
   .inputOptions(['-framerate 30', '-use_wallclock_as_timestamps 1'])
