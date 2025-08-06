@@ -7,105 +7,262 @@ const fs = require('fs');
 
 const STREAM_DIR = path.join(__dirname, 'hls-stream');
 const PORT = 3000;
-const TARGET_DIV_SELECTOR = '#container';  // <<< Change this to your div's CSS selector
+const TARGET_DIV_SELECTOR = '#container';
+const INACTIVITY_TIMEOUT_MS = 10000;
 
-async function startStream() {
-  // Clean up previous stream files
-  if (fs.existsSync(STREAM_DIR)) {
-    fs.rmSync(STREAM_DIR, { recursive: true });
-  }
-  fs.mkdirSync(STREAM_DIR);
+let browser, page, boundingBox;
+let streamStarted = false;
+let screenshotStream;
+let ffmpegProcess;
+let inactivityTimer;
+let restartingPage = false;
+let fakeSegmentCreated = false;
 
-  // Write minimal empty playlist for immediate client load
-  fs.writeFileSync(
-    path.join(STREAM_DIR, 'stream.m3u8'),
-    `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:1
-#EXT-X-MEDIA-SEQUENCE:0
-`
-  );
+// ─── Utility: create initial fake black segment ──────────────────────────
+function createFakeSegment() {
+  if (!fs.existsSync(STREAM_DIR)) fs.mkdirSync(STREAM_DIR);
 
-  // Launch Puppeteer browser & page
-  const browser = await puppeteer.launch({ headless: true });
-  const page = await browser.newPage();
-  await page.goto('https://mwood77.github.io/ws4kp-international/?hazards-checkbox=false&current-weather-checkbox=true&latest-observations-checkbox=false&hourly-checkbox=true&hourly-graph-checkbox=true&travel-checkbox=false&regional-forecast-checkbox=false&local-forecast-checkbox=true&extended-forecast-checkbox=true&almanac-checkbox=true&radar-checkbox=false&marine-forecast-checkbox=true&aqi-forecast-checkbox=true&settings-experimentalFeatures-checkbox=false&settings-hideWebamp-checkbox=false&settings-kiosk-checkbox=false&settings-scanLines-checkbox=false&settings-wide-checkbox=false&chkAutoRefresh=true&settings-windUnits-select=2.00&settings-marineWindUnits-select=1.00&settings-marineWaveHeightUnits-select=1.00&settings-temperatureUnits-select=1.00&settings-distanceUnits-select=1.00&settings-pressureUnits-select=1.00&settings-hoursFormat-select=2.00&settings-speed-select=1.00&latLonQuery=Paris%2C+%C3%8Ele-de-France%2C+FRA&latLon=%7B%22lat%22%3A48.8563%2C%22lon%22%3A2.3525%7D', { waitUntil: 'domcontentloaded' });
+  const fakeSegmentPath = path.join(STREAM_DIR, 'stream0.ts');
+  const fakePlaylistPath = path.join(STREAM_DIR, 'stream.m3u8');
 
-  // Get bounding box of the target div
-  const element = await page.$(TARGET_DIV_SELECTOR);
-  if (!element) {
-    throw new Error(`Element not found for selector: ${TARGET_DIV_SELECTOR}`);
-  }
-  const boundingBox = await element.boundingBox();
-  if (!boundingBox) {
-    throw new Error('Bounding box not found (element might be hidden)');
-  }
+  // Only generate if it doesn't exist
+  if (fs.existsSync(fakeSegmentPath)) return Promise.resolve();
 
-  const screenshotStream = new PassThrough();
-
-  // Start FFmpeg process
-  ffmpeg()
-    .input(screenshotStream)
-    .inputFormat('image2pipe')
-    .inputOptions('-framerate 10')
-    .outputOptions([
-      '-c:v libx264',
-      '-preset ultrafast',
-      '-tune zerolatency',
-      '-pix_fmt yuv420p',
-      '-g 10', // keyframe every 1 second (at 10fps)
-      '-f hls',
-      '-hls_time 0.5',
-      '-hls_list_size 3',
-      '-hls_flags delete_segments+append_list+omit_endlist',
-      '-hls_allow_cache 0',
-    ])
-    .output(path.join(STREAM_DIR, 'stream.m3u8'))
-    .on('start', cmd => console.log('FFmpeg started:', cmd))
-    .on('error', err => console.error('FFmpeg error:', err.message))
-    .on('end', () => console.log('FFmpeg ended'))
-    .run();
-
-  // Send a few initial clipped screenshots quickly to prime FFmpeg & playlist
-  for (let i = 0; i < 5; i++) {
-    const buffer = await page.screenshot({
-      type: 'jpeg',
-      quality: 80,
-      clip: {
-        x: boundingBox.x,
-        y: boundingBox.y,
-        width: Math.min(boundingBox.width, page.viewport().width - boundingBox.x),
-        height: Math.min(boundingBox.height, page.viewport().height - boundingBox.y),
-      },
-    });
-    screenshotStream.write(buffer);
-  }
-
-  // Continue capturing clipped screenshots at 10fps
-  (async function captureLoop() {
-    while (true) {
-      await new Promise(res => setTimeout(res, 100));
-      const buffer = await page.screenshot({
-        type: 'jpeg',
-        quality: 80,
-        clip: {
-          x: boundingBox.x,
-          y: boundingBox.y,
-          width: Math.min(boundingBox.width, page.viewport().width - boundingBox.x),
-          height: Math.min(boundingBox.height, page.viewport().height - boundingBox.y),
-        },
-      });
-      screenshotStream.write(buffer);
-    }
-  })();
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input('color=black:s=640x360:d=2') // 2s black frame
+      .inputFormat('lavfi')
+      .outputOptions([
+        '-c:v libx264',
+        '-t 2',
+        '-pix_fmt yuv420p',
+        '-f hls',
+        '-hls_time 2',
+        '-hls_list_size 1',
+        '-hls_flags append_list+delete_segments',
+        '-hls_allow_cache 0',
+      ])
+      .output(fakePlaylistPath)
+      .on('start', cmd => console.log('Creating fake segment for VLC:', cmd))
+      .on('error', err => reject(err))
+      .on('end', () => {
+        console.log('Fake segment ready');
+        resolve();
+      })
+      .run();
+  });
 }
 
+async function ensureFakeSegment() {
+  if (fakeSegmentCreated) return;
+  await createFakeSegment();
+  fakeSegmentCreated = true;
+}
+
+// ─── Puppeteer setup ────────────────────────────────────────────────
+async function initializeBrowser() {
+  if (browser) await browser.close();
+  browser = await puppeteer.launch({ headless: true });
+  page = await browser.newPage();
+
+  page.on('error', err => { console.error('Puppeteer page error:', err); safeRestartPage(); });
+  page.on('close', () => { console.error('Puppeteer page closed unexpectedly'); safeRestartPage(); });
+  page.on('disconnect', () => { console.error('Puppeteer disconnected'); safeRestartPage(); });
+
+  await loadTargetPage();
+}
+
+async function loadTargetPage() {
+  try {
+    await page.goto('https://mwood77.github.io/ws4kp-international/?hazards-checkbox=false&current-weather-checkbox=true&latest-observations-checkbox=false&hourly-checkbox=true&hourly-graph-checkbox=true&travel-checkbox=false&regional-forecast-checkbox=false&local-forecast-checkbox=true&extended-forecast-checkbox=true&almanac-checkbox=true&radar-checkbox=false&marine-forecast-checkbox=true&aqi-forecast-checkbox=true&settings-experimentalFeatures-checkbox=false&settings-hideWebamp-checkbox=false&settings-kiosk-checkbox=false&settings-scanLines-checkbox=false&settings-wide-checkbox=false&chkAutoRefresh=true&settings-windUnits-select=2.00&settings-marineWindUnits-select=1.00&settings-marineWaveHeightUnits-select=1.00&settings-temperatureUnits-select=1.00&settings-distanceUnits-select=1.00&settings-pressureUnits-select=1.00&settings-hoursFormat-select=2.00&settings-speed-select=1.00&latLonQuery=Paris%2C+%C3%8Ele-de-France%2C+FRA&latLon=%7B%22lat%22%3A48.8563%2C%22lon%22%3A2.3525%7D', { waitUntil: 'domcontentloaded' });
+
+    const element = await page.$(TARGET_DIV_SELECTOR);
+    if (!element) throw new Error(`Element not found: ${TARGET_DIV_SELECTOR}`);
+    boundingBox = await element.boundingBox();
+    if (!boundingBox) throw new Error('Bounding box not found');
+  } catch (err) {
+    console.error('Failed to load target page:', err);
+  }
+}
+
+function safeRestartPage() {
+  if (restartingPage) return;
+  restartingPage = true;
+  setTimeout(async () => {
+    try {
+      console.log('Restarting Puppeteer page...');
+      if (page && !page.isClosed()) await page.close();
+      page = await browser.newPage();
+      restartingPage = false;
+      await loadTargetPage();
+    } catch (err) {
+      console.error('Failed to restart Puppeteer page:', err);
+      restartingPage = false;
+    }
+  }, 1000);
+}
+
+// ─── Streaming ──────────────────────────────────────────────────────
+async function startStream() {
+  if (streamStarted) return;
+  streamStarted = true;
+
+  // Clean folder except fake segment
+  if (fs.existsSync(STREAM_DIR)) {
+    fs.readdirSync(STREAM_DIR).forEach(f => {
+      if (!f.startsWith('stream0')) fs.unlinkSync(path.join(STREAM_DIR, f));
+    });
+  }
+
+  screenshotStream = new PassThrough();
+
+  ffmpeg()
+  .input(screenshotStream)
+  .inputFormat('image2pipe')
+  .inputOptions(['-framerate 30', '-use_wallclock_as_timestamps 1'])
+  .input(path.join(__dirname, 'music.mp3'))
+  .inputOptions(['-stream_loop -1'])
+  .outputOptions([
+    '-vf fps=10',
+    '-c:v libx264',
+    '-preset ultrafast',
+    '-tune zerolatency',
+    '-pix_fmt yuv420p',
+    '-r 10',
+    '-g 11',
+    '-hls_time 0.5',
+    '-hls_list_size 20',
+    '-hls_flags delete_segments+append_list+program_date_time',
+    '-hls_allow_cache 0'
+  ])
+  .output(path.join(STREAM_DIR, 'stream.m3u8'))
+  .on('start', cmd => console.log('FFmpeg started:', cmd))
+  .on('error', err => { console.error('FFmpeg error:', err.message); stopStream(); })
+  .on('end', () => { console.log('FFmpeg ended'); streamStarted = false; })
+  .run();
+
+
+
+  // Prime screenshots fast
+  for (let i = 0; i < 100 && streamStarted; i++) {
+    try {
+      const buffer = await page.screenshot({ type: 'jpeg', quality: 80, clip: boundingBox });
+      if (streamStarted && screenshotStream) {
+        screenshotStream.write(buffer);
+      }
+    } catch (err) {
+      console.error('Initial screenshot error:', err);
+      break;
+    }
+  }
+
+  // Fast capture loop
+  (async function captureLoop() {
+    while (streamStarted) {
+      try {
+        const buffer = await page.screenshot({ type: 'jpeg', quality: 80, clip: boundingBox });
+        if (streamStarted && screenshotStream) screenshotStream.write(buffer);
+        await new Promise(res => setImmediate(res)); // virtually no delay
+      } catch (err) {
+        console.error('Screenshot error:', err.message);
+        safeRestartPage();
+      }
+    }
+  })();
+
+  // 👇 Add the segment count logger here
+  setInterval(() => {
+    const tsFiles = fs.readdirSync(STREAM_DIR).filter(f => f.endsWith('.ts'));
+    console.log('Segment count:', tsFiles.length);
+  }, 500);
+}
+
+//}
+
+function stopStream() {
+  if (!streamStarted) return;
+  console.log('Stopping stream due to inactivity');
+  streamStarted = false;
+
+  if (ffmpegProcess) {
+    ffmpegProcess.kill('SIGINT');
+    ffmpegProcess = null;
+  }
+  if (screenshotStream) {
+    screenshotStream.end();
+    screenshotStream = null;
+  }
+}
+
+function resetInactivityTimer() {
+  if (inactivityTimer) clearTimeout(inactivityTimer);
+  inactivityTimer = setTimeout(stopStream, INACTIVITY_TIMEOUT_MS);
+}
+
+// ─── Express server ───────────────────────────────────────────────
 const app = express();
 
-// Serve HLS stream folder statically
+app.get('/*.ts', (req, res, next) => {
+  console.log(`TS segment requested: ${req.path}`);
+  resetInactivityTimer();
+  next();
+});
+
+app.get('/stream.m3u8', async (req, res) => {
+  try {
+    resetInactivityTimer();
+
+    // Only ensure fake segment once
+    await ensureFakeSegment();
+
+    await startStream();
+
+    // Wait for at least 3 real segments to exist
+    const maxWait = 5000;
+    const pollInterval = 100;
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      const files = fs.readdirSync(STREAM_DIR).filter(f => f.endsWith('.ts') && f !== 'stream0.ts');
+      if (files.length >= 3) break;
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+
+    res.sendFile(path.join(STREAM_DIR, 'stream.m3u8'));
+  } catch (err) {
+    console.error('Error sending stream:', err);
+    res.status(500).send('Failed to start stream');
+  }
+});
+
 app.use('/', express.static(STREAM_DIR));
 
-app.listen(PORT, () => {
-  console.log(`HTTP server running on http://localhost:${PORT}`);
-  startStream().catch(console.error);
+// Optional test page
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+    <body>
+      <h1>HLS Test Stream</h1>
+      <video id="video" controls autoplay width="600"></video>
+      <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+      <script>
+        const video = document.getElementById('video');
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hls.loadSource('/stream.m3u8');
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        } else {
+          video.src = '/stream.m3u8';
+        }
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, async () => {
+  // Create the fake segment once at startup
+  await ensureFakeSegment();
+  await initializeBrowser();
+  console.log(`Browser ready. HTTP server running on http://localhost:${PORT}`);
 });
