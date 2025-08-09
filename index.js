@@ -46,6 +46,7 @@ async function loadTargetPage() {
 }
 
 function safeRestartPage() {
+  browser.close()
   if (restartingPage) return;
   restartingPage = true;
   setTimeout(async () => {
